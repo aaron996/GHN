@@ -1,30 +1,27 @@
 -- =============================================================================
--- TRUY VẤN CHI TIẾT ĐƠN HÀNG TTS VÀ BIẾN ĐỘNG ĐO ĐẠC KLKT — CUỐI THÁNG 5/2026
--- TIÊU CHUẨN ĐO ĐẠC NGHIÊM NGẶT: ĐỦ 4 CHIỀU (W-L-W-H > 0) TRÊN CÙNG MỘT KHO
+-- TRUY VẤN CHI TIẾT ĐƠN HÀNG TTS VÀ BIẾN ĐỘNG ĐO ĐẠC KLKT — N-1
+-- TIÊU CHUẨN MẪU: ĐỦ 4 CHIỀU (W-L-W-H > 0) TRÊN CÙNG MỘT KHO (không cần cùng phút)
+-- TIÊU CHUẨN GAP: CHÊNH LỆCH CÂN NẶNG (weight-only, không yêu cầu dim)
 -- HẠT DỮ LIỆU (GRAIN): CHI TIẾT ĐẾN TỪNG MÃ ĐƠN HÀNG (ORDER_CODE)
 --
 -- ĐIỀU KIỆN LỌC KIỂM TOÁN CHẶT CHẼ (KAS AUDIT CONDITIONS):
---   1. Ngày hoàn thành thành công (Deli/Return) trong khoảng: 25/05/2026 - 31/05/2026
---   2. Đơn hàng bắt buộc đi qua ít nhất 1 trong 2 kho trọng điểm: Hưng Yên (21365000) hoặc Xuyên Á (1626)
---   3. Đơn hàng BẮT BUỘC phải xuất hiện sai số đo đạc thuộc 1 trong 2 nhóm:
---      - Có GAP 1: Ít nhất 2 lần đo hợp lệ tại cùng 1 kho (phát hiện lỗi ổn định thiết bị)
---      - Có GAP 2: Được đo hợp lệ tại cả 2 kho HY và XA (phát hiện lỗi lệch chuẩn liên miền)
---
--- CẢI TIẾN ĐỊNH DẠNG (DATA GOVERNANCE):
---   - Áp dụng ROUND(..., 3) cho tất cả các trường trọng lượng thập phân để triệt tiêu
---     sai số dấu thập phân IEEE 754 (Float Noise) và tránh lỗi nhận diện sai dấu ngăn cách của Excel.
+--   1. Ngày hoàn thành thành công (Deli/Return) = N-1
+--   2. Đơn hàng bắt buộc đã được đo đủ 4 chiều tại ít nhất 1 kho (tiêu chuẩn V2)
+--   3. Đơn hàng BẮT BUỘC có sai số cân thuộc 1 trong 2 nhóm:
+--      - GAP 1: >= 2 lần cân tại cùng 1 kho (chênh lệch lần cuối - lần đầu)
+--      - GAP 2: Được cân tại cả 2 kho HY và XA (chênh lệch lần cân cuối giữa 2 kho)
 --
 -- TEAM PHÂN TÍCH: KAS DATA GOVERNANCE & STRATEGIC PLANNING
 -- =============================================================================
 
 WITH date_config AS (
     SELECT
-        DATE '2026-05-25'  AS start_date, -- Giới hạn từ ngày 25/05
-        DATE '2026-06-09'  AS end_date,   -- Đến ngày 31/05
-        DATE '2026-04-25'  AS partition_start
+        CAST(CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Ho_Chi_Minh' AS DATE) - INTERVAL '1' DAY  AS start_date,
+        CAST(CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Ho_Chi_Minh' AS DATE) - INTERVAL '1' DAY  AS end_date,
+        CAST(CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Ho_Chi_Minh' AS DATE) - INTERVAL '30' DAY AS partition_start  -- mở rộng 30 ngày để đủ buffer đơn leadtime dài
 ),
 
--- [BƯỚC 1] Tập mẫu đơn hàng hoàn tất toàn quốc thoả mãn điều kiện khung thời gian và tuyến bưu cục
+-- [BƯỚC 1] Tập mẫu đơn hàng hoàn tất toàn quốc — success_date = N-1
 base_orders AS (
     SELECT
         b.ordercode,
@@ -48,7 +45,6 @@ base_orders AS (
     CROSS JOIN date_config d
     WHERE b.clientid IN (3819710, 4447237)
       AND b.currentstatus IN ('delivered', 'returned')
-      -- Điều kiện thời gian: Khung ngày hoàn thành từ 25 - 31/05
       AND (
           (b.currentstatus = 'delivered'
               AND b.enddeliverytime IS NOT NULL
@@ -58,18 +54,14 @@ base_orders AS (
               AND b.endreturntime IS NOT NULL
               AND CAST(b.endreturntime AS DATE) BETWEEN d.start_date AND d.end_date)
       )
-      -- Điều kiện kho bãi: Bắt buộc đơn đi qua ít nhất 1 trong 2 kho trung chuyển (Hưng Yên hoặc Xuyên Á)
-      AND (
-             b.firstsortingcenterid  IN (1626, 21365000)
-          OR b.secondsortingcenterid IN (1626, 21365000)
-          OR b.thirdsortingcenterid  IN (1626, 21365000)
-          OR b.lastsortingcenterid   IN (1626, 21365000)
-      )
       AND b.createddate_partition >= d.partition_start
 ),
 
 -- [BƯỚC 2] Thu thập dữ liệu đo đạc thô từ thiết bị DWS, Matrix, cân tự động
+-- Fix: tất cả nhánh dùng >= d.partition_start thay vì >= d.start_date
+-- để bắt được log đo đạc xảy ra trước ngày hoàn thành (đơn leadtime dài)
 raw_measurements AS (
+    -- Feeder cân tại Xuyên Á
     SELECT
         h.order_code, h.location_id, h.last_updated_time,
         TRY(CAST(JSON_EXTRACT_SCALAR(h.data, '$.feederWeight') AS DOUBLE)) AS raw_weight_gram,
@@ -80,12 +72,30 @@ raw_measurements AS (
     INNER JOIN base_orders b ON h.order_code = b.ordercode
     CROSS JOIN date_config d
     WHERE h.action = 'SORTING_PARCEL'
-      AND h.location_id = '1626' -- Kho Xuyên Á
+      AND h.location_id = '1626'
       AND h.order_code IS NOT NULL
-      AND CAST(h.date_partition AS DATE) >= d.start_date
+      AND CAST(h.date_partition AS DATE) >= d.partition_start  -- fix
 
     UNION ALL
 
+    -- Feeder cân tại Hưng Yên
+    SELECT
+        h.order_code, h.location_id, h.last_updated_time,
+        TRY(CAST(JSON_EXTRACT_SCALAR(h.data, '$.feederWeight') AS DOUBLE)) AS raw_weight_gram,
+        CAST(NULL AS DOUBLE) AS raw_length_mm,
+        CAST(NULL AS DOUBLE) AS raw_width_mm,
+        CAST(NULL AS DOUBLE) AS raw_height_mm
+    FROM "dw-ghn".data_auto_sorting.data_sorting_history h
+    INNER JOIN base_orders b ON h.order_code = b.ordercode
+    CROSS JOIN date_config d
+    WHERE h.action = 'SORTING_PARCEL'
+      AND h.location_id = '21365000'
+      AND h.order_code IS NOT NULL
+      AND CAST(h.date_partition AS DATE) >= d.partition_start  -- fix
+
+    UNION ALL
+
+    -- Cân tại Hưng Yên (WEIGHING_PARCEL)
     SELECT
         h.order_code, h.location_id, h.last_updated_time,
         TRY(CAST(JSON_EXTRACT_SCALAR(h.data, '$.weight') AS DOUBLE)),
@@ -94,12 +104,13 @@ raw_measurements AS (
     INNER JOIN base_orders b ON h.order_code = b.ordercode
     CROSS JOIN date_config d
     WHERE h.action = 'WEIGHING_PARCEL'
-      AND h.location_id = '21365000' -- Kho Hưng Yên
+      AND h.location_id = '21365000'
       AND h.order_code IS NOT NULL
-      AND CAST(h.date_partition AS DATE) >= d.start_date
+      AND CAST(h.date_partition AS DATE) >= d.partition_start  -- fix
 
     UNION ALL
 
+    -- DWS kích thước tại cả 2 kho
     SELECT
         h.order_code, h.location_id, h.last_updated_time,
         NULL,
@@ -112,10 +123,11 @@ raw_measurements AS (
     WHERE h.action = 'DWS_PARCEL'
       AND h.location_id IN ('1626', '21365000')
       AND h.order_code IS NOT NULL
-      AND CAST(h.date_partition AS DATE) >= d.start_date
+      AND CAST(h.date_partition AS DATE) >= d.partition_start  -- fix
 
     UNION ALL
 
+    -- Matrix (cân + kích thước) tại cả 2 kho
     SELECT
         h.order_code, h.location_id, h.last_updated_time,
         TRY(CAST(JSON_EXTRACT_SCALAR(h.data, '$.dwsWeight') AS DOUBLE)),
@@ -128,29 +140,44 @@ raw_measurements AS (
     WHERE h.action = 'MATRIX_SCANNED_PARCEL'
       AND h.location_id IN ('1626', '21365000')
       AND h.order_code IS NOT NULL
-      AND CAST(h.date_partition AS DATE) >= d.start_date
+      AND CAST(h.date_partition AS DATE) >= d.partition_start  -- fix
 ),
 
--- [BƯỚC 3] Gom nhóm bất đồng bộ và chuẩn hóa lượt đo (Passes) hợp lệ 4 chiều tại từng kho
-valid_measurements AS (
+-- [BƯỚC 3A] Xác định đơn đủ điều kiện vào tệp mẫu — đủ 4 chiều tại cùng 1 kho, không cần cùng phút
+-- Dùng để: lọc tệp mẫu + derive id_ktc
+valid_4d AS (
     SELECT
         order_code,
-        location_id,
-        DATE_TRUNC('minute', last_updated_time) AS measured_time,
-        ROUND(MAX(raw_weight_gram) / 1000.0, 3) AS klkt_rdc_kg
+        location_id
     FROM raw_measurements
-    GROUP BY order_code, location_id, DATE_TRUNC('minute', last_updated_time)
+    GROUP BY order_code, location_id
     HAVING MAX(raw_weight_gram) > 0
        AND MAX(raw_length_mm) > 0
        AND MAX(raw_width_mm) > 0
        AND MAX(raw_height_mm) > 0
 ),
 
--- [BƯỚC 4] Xác định kết quả lần đo đầu/cuối và số lần đi qua máy quét tại từng kho (HY & XA)
+-- [BƯỚC 3B] Tái dựng từng lần cân theo phút — weight-only, không yêu cầu đủ 4 chiều
+-- Dùng để: tính pass_count, first/last weight cho gap1 và gap2
+-- Join theo order_code (không theo location_id) để bắt được weight tại kho không đủ 4 chiều
+valid_weight AS (
+    SELECT
+        r.order_code,
+        r.location_id,
+        DATE_TRUNC('minute', r.last_updated_time) AS measured_time,
+        ROUND(MAX(r.raw_weight_gram) / 1000.0, 3) AS klkt_rdc_kg
+    FROM raw_measurements r
+    INNER JOIN (
+        SELECT DISTINCT order_code FROM valid_4d
+    ) v ON r.order_code = v.order_code
+    GROUP BY r.order_code, r.location_id, DATE_TRUNC('minute', r.last_updated_time)
+    HAVING MAX(r.raw_weight_gram) > 0
+),
+
+-- [BƯỚC 4] Metrics first/last/pass_count theo từng kho — dùng cho cả gap1 và gap2
 warehouse_metrics AS (
     SELECT
         order_code,
-        -- Các thông số đo lường tại kho Hưng Yên (HY - 21365000)
         MIN_BY(
             CASE WHEN location_id = '21365000' THEN klkt_rdc_kg END,
             CASE WHEN location_id = '21365000' THEN measured_time END
@@ -161,7 +188,6 @@ warehouse_metrics AS (
         ) AS klkt_last_HY,
         COUNT(DISTINCT CASE WHEN location_id = '21365000' THEN measured_time END) AS pass_count_HY,
 
-        -- Các thông số đo lường tại kho Xuyên Á (XA - 1626)
         MIN_BY(
             CASE WHEN location_id = '1626' THEN klkt_rdc_kg END,
             CASE WHEN location_id = '1626' THEN measured_time END
@@ -171,21 +197,18 @@ warehouse_metrics AS (
             CASE WHEN location_id = '1626' THEN measured_time END
         ) AS klkt_last_XA,
         COUNT(DISTINCT CASE WHEN location_id = '1626' THEN measured_time END) AS pass_count_XA
-    FROM valid_measurements
+    FROM valid_weight
     GROUP BY order_code
 ),
 
--- [BƯỚC 5] Tính toán giá trị GAP theo logic kiểm toán dữ liệu của KAS
+-- [BƯỚC 5] Tính GAP theo logic kiểm toán KAS
 gap_calculations AS (
     SELECT
         w.order_code,
         w.klkt_last_HY,
         w.klkt_last_XA,
 
-        -- GAP 1: Sai lệch đo đạc nội bộ của cùng một kho (HY hoặc XA)
-        -- Điều kiện: Kho đó bắt buộc phải có ít nhất 2 lượt đo (passes) hợp lệ.
-        -- Nếu cả hai kho đều thỏa mãn điều kiện, lấy giá trị sai lệch lớn nhất để làm chỉ số rủi ro thiết bị.
-        -- Trả về NULL nếu không có kho nào ghi nhận >= 2 lần đo.
+        -- GAP 1: chênh lệch cân nội kho (lần cuối - lần đầu), cần >= 2 lần cân
         CASE
             WHEN w.pass_count_HY >= 2 AND w.pass_count_XA >= 2
                 THEN GREATEST(ABS(w.klkt_last_HY - w.klkt_first_HY), ABS(w.klkt_last_XA - w.klkt_first_XA))
@@ -196,9 +219,7 @@ gap_calculations AS (
             ELSE NULL
         END AS gap1_val,
 
-        -- GAP 2: Sai lệch đo lường chéo liên miền giữa lần đo cuối tại HY vs lần đo cuối tại XA
-        -- Điều kiện: Đơn hàng bắt buộc phải có thông số đo đạc hợp lệ tại cả hai đầu kho.
-        -- Trả về NULL nếu đơn không đi qua hoặc không được quét thành công tại một trong hai kho.
+        -- GAP 2: chênh lệch cân chéo 2 kho (lần cân cuối HY vs lần cân cuối XA)
         CASE
             WHEN w.klkt_last_HY IS NOT NULL AND w.klkt_last_XA IS NOT NULL
                 THEN ABS(w.klkt_last_HY - w.klkt_last_XA)
@@ -207,17 +228,22 @@ gap_calculations AS (
     FROM warehouse_metrics w
 )
 
--- [BƯỚC 6] Xuất dữ liệu chi tiết ở mức mã đơn hàng (Raw Order Level)
--- Áp dụng bộ lọc nghiêm ngặt: Chỉ lấy đơn hàng có Gap 1 HOẶC Gap 2 hợp lệ
+-- [BƯỚC 6] Xuất dữ liệu chi tiết ở mức mã đơn hàng
+-- Chỉ lấy đơn có gap1 HOẶC gap2 hợp lệ
 SELECT
     b.ordercode,
     b.success_date,
     b.client_type,
     b.journey_type,
-    ROUND(g.klkt_last_HY, 3)                AS rdc_last_measured_HY_kg,
-    ROUND(g.klkt_last_XA, 3)                AS rdc_last_measured_XA_kg,
-    ROUND(g.gap1_val, 3)                    AS intra_warehouse_gap1_kg,
-    ROUND(g.gap2_val, 3)                    AS cross_warehouse_gap2_kg
+    CASE
+        WHEN g.klkt_last_HY IS NOT NULL AND g.klkt_last_XA IS NOT NULL THEN 'HY + XA'
+        WHEN g.klkt_last_HY IS NOT NULL                                THEN '21365000'
+        WHEN g.klkt_last_XA IS NOT NULL                                THEN '1626'
+    END                                         AS id_ktc,
+    ROUND(g.klkt_last_HY, 3)                    AS rdc_last_measured_HY_kg,
+    ROUND(g.klkt_last_XA, 3)                    AS rdc_last_measured_XA_kg,
+    ROUND(g.gap1_val, 3)                        AS intra_warehouse_gap1_kg,
+    ROUND(g.gap2_val, 3)                        AS cross_warehouse_gap2_kg
 FROM base_orders b
 INNER JOIN gap_calculations g ON b.ordercode = g.order_code
 WHERE g.gap1_val IS NOT NULL
@@ -230,13 +256,14 @@ ORDER BY
 -- =============================================================================
 -- PHÂN TÍCH HIỆU SUẤT ĐO ĐẠC KLKT KHÁCH HÀNG TTS — 3 THÁNG FULL GẦN NHẤT + MTD (GRAIN: NGÀY)
 -- WINDOW: T3, T4, T5 (full) + T6 (MTD đến ngày hiện tại)
--- TIÊU CHUẨN ĐO ĐẠC NGHIÊM NGẶT: ĐỦ 4 CHIỀU (W-L-W-H > 0) TRÊN CÙNG MỘT KHO
+-- TIÊU CHUẨN ĐO ĐẠC NGHIÊM NGẶT: ĐỦ 4 CHIỀU (W-L-W-H > 0) TRÊN CÙNG MỘT KHO (không cần cùng phút)
+-- TEAM PHÂN TÍCH: KAS DATA GOVERNANCE & STRATEGIC PLANNING
 -- =============================================================================
 
 WITH date_config AS (
     SELECT
-        DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '3' MONTH  AS start_date,     -- đầu T3
-        CURRENT_DATE                                            AS end_date,       -- MTD: đến hôm nay
+        DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '3' MONTH  AS start_date,
+        CURRENT_DATE                                            AS end_date,
         DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '3' MONTH  AS partition_start
 ),
 
@@ -277,7 +304,9 @@ base_orders AS (
 ),
 
 -- [BƯỚC 2] Thu thập dữ liệu đo đạc raw từ hệ thống DWS / Matrix
+-- Fix: thêm nhánh SORTING_PARCEL tại HY (21365000) — trước đây bị bỏ sót
 raw_measurements AS (
+    -- Feeder cân tại Xuyên Á
     SELECT
         h.order_code, h.location_id, h.last_updated_time,
         TRY(CAST(JSON_EXTRACT_SCALAR(h.data, '$.feederWeight') AS DOUBLE)) AS raw_weight_gram,
@@ -288,12 +317,30 @@ raw_measurements AS (
     INNER JOIN base_orders b ON h.order_code = b.ordercode
     CROSS JOIN date_config d
     WHERE h.action = 'SORTING_PARCEL'
-      AND h.location_id = '1626' -- Kho Xuyên Á (XY)
+      AND h.location_id = '1626'
       AND h.order_code IS NOT NULL
       AND CAST(h.date_partition AS DATE) >= d.start_date
 
     UNION ALL
 
+    -- Feeder cân tại Hưng Yên (nhánh mới — trước đây bị thiếu)
+    SELECT
+        h.order_code, h.location_id, h.last_updated_time,
+        TRY(CAST(JSON_EXTRACT_SCALAR(h.data, '$.feederWeight') AS DOUBLE)) AS raw_weight_gram,
+        CAST(NULL AS DOUBLE) AS raw_length_mm,
+        CAST(NULL AS DOUBLE) AS raw_width_mm,
+        CAST(NULL AS DOUBLE) AS raw_height_mm
+    FROM "dw-ghn".data_auto_sorting.data_sorting_history h
+    INNER JOIN base_orders b ON h.order_code = b.ordercode
+    CROSS JOIN date_config d
+    WHERE h.action = 'SORTING_PARCEL'
+      AND h.location_id = '21365000'
+      AND h.order_code IS NOT NULL
+      AND CAST(h.date_partition AS DATE) >= d.start_date
+
+    UNION ALL
+
+    -- Cân tại Hưng Yên (WEIGHING_PARCEL)
     SELECT
         h.order_code, h.location_id, h.last_updated_time,
         TRY(CAST(JSON_EXTRACT_SCALAR(h.data, '$.weight') AS DOUBLE)),
@@ -302,12 +349,13 @@ raw_measurements AS (
     INNER JOIN base_orders b ON h.order_code = b.ordercode
     CROSS JOIN date_config d
     WHERE h.action = 'WEIGHING_PARCEL'
-      AND h.location_id = '21365000' -- Kho Hưng Yên (HY)
+      AND h.location_id = '21365000'
       AND h.order_code IS NOT NULL
       AND CAST(h.date_partition AS DATE) >= d.start_date
 
     UNION ALL
 
+    -- DWS kích thước tại cả 2 kho
     SELECT
         h.order_code, h.location_id, h.last_updated_time,
         NULL,
@@ -324,6 +372,7 @@ raw_measurements AS (
 
     UNION ALL
 
+    -- Matrix (cân + kích thước) tại cả 2 kho
     SELECT
         h.order_code, h.location_id, h.last_updated_time,
         TRY(CAST(JSON_EXTRACT_SCALAR(h.data, '$.dwsWeight') AS DOUBLE)),
@@ -339,21 +388,38 @@ raw_measurements AS (
       AND CAST(h.date_partition AS DATE) >= d.start_date
 ),
 
--- [BƯỚC 3] Tái dựng các lần đo đơn lẻ hợp lệ 4 chiều (Làm tròn theo phút để map chéo log)
-valid_measurements AS (
+-- [BƯỚC 3A] Kiểm tra đơn có đủ 4 chiều tại từng kho không
+-- Fix: bỏ DATE_TRUNC minute — đủ 4 chiều tại cùng 1 kho là đủ điều kiện, không cần cùng phút
+valid_4d AS (
     SELECT
         order_code,
         location_id,
-        DATE_TRUNC('minute', last_updated_time) AS measured_time,
         ROUND(MAX(raw_weight_gram) / 1000.0, 3) AS weight_kg
     FROM raw_measurements
-    GROUP BY order_code, location_id, DATE_TRUNC('minute', last_updated_time)
+    GROUP BY order_code, location_id
     HAVING MAX(raw_weight_gram) > 0
        AND MAX(raw_length_mm) > 0
        AND MAX(raw_width_mm) > 0
        AND MAX(raw_height_mm) > 0
 ),
 
+-- [BƯỚC 3B] Tái dựng từng lần đo theo phút — chỉ trên đơn đã pass valid_4d
+-- Dùng để đếm pass_count và lấy first/last weight cho gap nội kho
+valid_passes AS (
+    SELECT
+        r.order_code,
+        r.location_id,
+        DATE_TRUNC('minute', r.last_updated_time) AS measured_time,
+        ROUND(MAX(r.raw_weight_gram) / 1000.0, 3) AS weight_kg
+    FROM raw_measurements r
+    INNER JOIN valid_4d v
+        ON r.order_code = v.order_code
+       AND r.location_id = v.location_id
+    GROUP BY r.order_code, r.location_id, DATE_TRUNC('minute', r.last_updated_time)
+    HAVING MAX(r.raw_weight_gram) > 0
+),
+
+-- [BƯỚC 4] Xác định kết quả lần đo đầu/cuối và số lần đi qua tại từng kho
 warehouse_metrics AS (
     SELECT
         order_code,
@@ -376,10 +442,11 @@ warehouse_metrics AS (
             CASE WHEN location_id = '1626' THEN measured_time END
         ) AS weight_last_XA,
         COUNT(DISTINCT CASE WHEN location_id = '1626' THEN measured_time END) AS pass_count_XA
-    FROM valid_measurements
+    FROM valid_passes
     GROUP BY order_code
 ),
 
+-- [BƯỚC 5] Tính gap nội kho (HY và XA riêng) + gap 2 kho
 gap_calculations AS (
     SELECT
         w.order_code,
@@ -399,9 +466,9 @@ gap_calculations AS (
             ELSE NULL
         END AS gap_2_kho_val
     FROM warehouse_metrics w
-)
+),
 
--- [BƯỚC 6] Tổng hợp kết quả — thêm report_month để tách T3/T4/T5/T6(MTD)
+-- [BƯỚC 6] Tổng hợp kết quả theo ngày
 SELECT
     b.success_date,
     b.client_type,
@@ -409,8 +476,10 @@ SELECT
 
     COUNT(DISTINCT b.ordercode)                                         AS mau_total_toan_quoc,
 
-    COUNT(DISTINCT CASE WHEN g.weight_last_HY IS NOT NULL THEN b.ordercode END) AS tu_do_dac_HY,
-    COUNT(DISTINCT CASE WHEN g.weight_last_XA IS NOT NULL THEN b.ordercode END) AS tu_do_dac_XA,
+    COUNT(DISTINCT CASE WHEN g.weight_last_HY IS NOT NULL
+                        THEN b.ordercode END)                           AS tu_do_dac_HY,
+    COUNT(DISTINCT CASE WHEN g.weight_last_XA IS NOT NULL
+                        THEN b.ordercode END)                           AS tu_do_dac_XA,
 
     COUNT(DISTINCT CASE WHEN g.gap_HY_val IS NOT NULL AND g.gap_HY_val < 1.0
                         THEN b.ordercode END)                           AS gap_HY_duoi_1kg,
